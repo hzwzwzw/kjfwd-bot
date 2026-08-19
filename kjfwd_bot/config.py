@@ -1,0 +1,415 @@
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Mapping, Optional, Tuple
+
+
+def load_dotenv(path: Path) -> None:
+    """读取简单的 KEY=VALUE 文件，不覆盖已有环境变量。"""
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key:
+            os.environ.setdefault(key, value)
+
+
+def _env_value(primary: str, fallback: Optional[str] = None) -> str:
+    value = os.getenv(primary, "").strip()
+    if not value and fallback:
+        value = os.getenv(fallback, "").strip()
+    return value
+
+
+@dataclass(frozen=True)
+class GroupConfig:
+    name: str
+    bot_nickname: str
+    listen_mode: str = "mention_only"
+    reply_groups: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LLMConfig:
+    base_url: str
+    model: str
+    api_key: str
+    temperature: float = 0.3
+    max_tokens: int = 700
+    timeout_seconds: float = 60.0
+    retries: int = 2
+    thinking_enabled: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class HistoryConfig:
+    database_path: Path
+    idle_timeout_seconds: int = 1800
+    max_messages: int = 100
+    max_characters: int = 16000
+    retention_days: int = 30
+    trigger_dedupe_seconds: float = 1.0
+
+
+@dataclass(frozen=True)
+class SearchConfig:
+    enabled: bool
+    api_key: str
+    endpoint: str = "https://api.search.brave.com/res/v1/llm/context"
+    timeout_seconds: float = 20.0
+    retries: int = 2
+    max_results: int = 5
+    max_context_tokens: int = 4096
+    max_snippets: int = 20
+    cache_seconds: int = 900
+    minimum_request_interval_seconds: float = 1.1
+    max_tool_rounds: int = 2
+
+
+@dataclass(frozen=True)
+class ConversationPoolConfig:
+    active_ttl_seconds: int = 1800
+    max_active: int = 5
+    global_fallback_seconds: int = 3600
+    global_fallback_max_messages: int = 80
+    low_information_recent_reply_seconds: int = 180
+
+
+@dataclass(frozen=True)
+class DebugConfig:
+    conversation_id_in_reply: bool = True
+    router_decision_log: bool = True
+
+
+@dataclass(frozen=True)
+class ReplyDebounceConfig:
+    delay_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class BowxtConfig:
+    base_url: str = "http://127.0.0.1:8787"
+    consumer: str = "kjfwd-bot"
+    claim_timeout_seconds: float = 20.0
+    lease_seconds: float = 180.0
+    batch_size: int = 8
+    require_sender: bool = False
+    replay_existing: bool = False
+    send_timeout_seconds: float = 45.0
+
+
+@dataclass(frozen=True)
+class ImageContextConfig:
+    enabled: bool = False
+    cache_path: Path = Path("data/images")
+    max_images: int = 4
+    max_image_bytes: int = 10 * 1024 * 1024
+    detail: str = "auto"
+    trigger_images: bool = False
+    lookback_seconds: int = 180
+
+
+@dataclass(frozen=True)
+class MessageReminderConfig:
+    enabled: bool = False
+    group: str = ""
+    source_groups: Tuple[str, ...] = ()
+    delay_seconds: float = 300.0
+
+
+@dataclass(frozen=True)
+class BotConfig:
+    groups: Tuple[GroupConfig, ...]
+    llm: LLMConfig
+    search: SearchConfig
+    history: HistoryConfig
+    conversation_pool: ConversationPoolConfig
+    debug: DebugConfig
+    reply_debounce: ReplyDebounceConfig
+    message_reminder: MessageReminderConfig
+    bowxt: BowxtConfig
+    image_context: ImageContextConfig
+    system_prompt_path: Path
+    skills_path: Path
+    queue_size_per_group: int = 5
+
+    @property
+    def group_names(self) -> Tuple[str, ...]:
+        return tuple(group.name for group in self.groups)
+
+    @property
+    def group_nicknames(self) -> Dict[str, str]:
+        return {group.name: group.bot_nickname for group in self.groups}
+
+    @property
+    def listen_modes(self) -> Dict[str, str]:
+        return {group.name: group.listen_mode for group in self.groups}
+
+    @property
+    def reply_groups(self) -> Dict[str, Tuple[str, ...]]:
+        return {group.name: group.reply_groups or (group.name,) for group in self.groups}
+
+
+def load_config(
+    config_path: Path,
+    *,
+    env_path: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> BotConfig:
+    config_path = config_path.resolve()
+    if env_path:
+        load_dotenv(env_path.resolve())
+    if environ:
+        for key, value in environ.items():
+            os.environ[str(key)] = str(value)
+
+    data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    base_dir = config_path.parent
+
+    group_items = data.get("groups", [])
+    groups = tuple(_parse_group_config(item) for item in group_items)
+    if not groups or any(not group.name or not group.bot_nickname for group in groups):
+        raise ValueError("groups 必须包含非空的 name 和 bot_nickname")
+    if len({group.name for group in groups}) != len(groups):
+        raise ValueError("groups 中不能有重复群名")
+    valid_modes = {"mention_only", "all_messages", "question_only"}
+    invalid_modes = sorted({group.listen_mode for group in groups} - valid_modes)
+    if invalid_modes:
+        raise ValueError(f"未知监听模式：{', '.join(invalid_modes)}")
+
+    llm_data = data.get("llm", {})
+    api_key = _env_value(str(llm_data.get("api_key_env", "API_KEY")))
+    base_url = str(llm_data.get("base_url", "")).strip() or _env_value(
+        str(llm_data.get("base_url_env", "BASE_URL"))
+    )
+    model = str(llm_data.get("model", "")).strip() or _env_value(
+        str(llm_data.get("model_env", "MODEL"))
+    )
+    if not api_key:
+        raise ValueError("未找到 LLM API Key 环境变量")
+    if not base_url or not model:
+        raise ValueError("LLM base_url 和 model 不能为空")
+    raw_thinking = llm_data.get("thinking_enabled")
+    thinking_enabled = None if raw_thinking is None else bool(raw_thinking)
+
+    history_data = data.get("history", {})
+    history = HistoryConfig(
+        database_path=_resolve_path(base_dir, history_data.get("database_path", "data/kjfwd.db")),
+        idle_timeout_seconds=int(history_data.get("idle_timeout_seconds", 1800)),
+        max_messages=int(history_data.get("max_messages", 100)),
+        max_characters=int(history_data.get("max_characters", 16000)),
+        retention_days=int(history_data.get("retention_days", 30)),
+        trigger_dedupe_seconds=float(history_data.get("trigger_dedupe_seconds", 1.0)),
+    )
+    if min(history.idle_timeout_seconds, history.max_messages, history.max_characters) <= 0:
+        raise ValueError("history 的时间、消息数和字符数限制必须大于 0")
+
+    search_data = data.get("search", {})
+    search_enabled = bool(search_data.get("enabled", True))
+    search_api_key = _env_value(str(search_data.get("api_key_env", "BRAVE_KEY")))
+    if search_enabled and not search_api_key:
+        raise ValueError("联网搜索已启用，但未找到 Brave API Key 环境变量")
+    search = SearchConfig(
+        enabled=search_enabled,
+        api_key=search_api_key,
+        endpoint=str(
+            search_data.get("endpoint", "https://api.search.brave.com/res/v1/llm/context")
+        ).strip(),
+        timeout_seconds=float(search_data.get("timeout_seconds", 20)),
+        retries=int(search_data.get("retries", 2)),
+        max_results=int(search_data.get("max_results", 5)),
+        max_context_tokens=int(search_data.get("max_context_tokens", 4096)),
+        max_snippets=int(search_data.get("max_snippets", 20)),
+        cache_seconds=int(search_data.get("cache_seconds", 900)),
+        minimum_request_interval_seconds=float(
+            search_data.get("minimum_request_interval_seconds", 1.1)
+        ),
+        max_tool_rounds=int(search_data.get("max_tool_rounds", 2)),
+    )
+    if search.enabled and min(
+        search.timeout_seconds,
+        search.max_results,
+        search.max_context_tokens,
+        search.max_snippets,
+        search.max_tool_rounds,
+    ) <= 0:
+        raise ValueError("search 的超时、结果数、上下文和工具轮数必须大于 0")
+
+    pool_data = data.get("conversation_pool", {})
+    conversation_pool = ConversationPoolConfig(
+        active_ttl_seconds=int(pool_data.get("active_ttl_seconds", 1800)),
+        max_active=int(pool_data.get("max_active", 5)),
+        global_fallback_seconds=int(pool_data.get("global_fallback_seconds", 3600)),
+        global_fallback_max_messages=int(pool_data.get("global_fallback_max_messages", 80)),
+        low_information_recent_reply_seconds=int(
+            pool_data.get("low_information_recent_reply_seconds", 180)
+        ),
+    )
+    if min(
+        conversation_pool.active_ttl_seconds,
+        conversation_pool.max_active,
+        conversation_pool.global_fallback_seconds,
+        conversation_pool.global_fallback_max_messages,
+        conversation_pool.low_information_recent_reply_seconds,
+    ) <= 0:
+        raise ValueError("conversation_pool 的时间和数量限制必须大于 0")
+
+    debug_data = data.get("debug", {})
+    debug = DebugConfig(
+        conversation_id_in_reply=bool(debug_data.get("conversation_id_in_reply", True)),
+        router_decision_log=bool(debug_data.get("router_decision_log", True)),
+    )
+
+    debounce_data = data.get("reply_debounce", {})
+    reply_debounce = ReplyDebounceConfig(
+        delay_seconds=float(debounce_data.get("delay_seconds", 0.0)),
+    )
+    if reply_debounce.delay_seconds < 0:
+        raise ValueError("reply_debounce.delay_seconds 不能小于 0")
+
+    bowxt_data = data.get("bowxt", {})
+    bowxt = BowxtConfig(
+        base_url=str(bowxt_data.get("base_url", "http://127.0.0.1:8787")).strip(),
+        consumer=str(bowxt_data.get("consumer", "kjfwd-bot")).strip(),
+        claim_timeout_seconds=float(bowxt_data.get("claim_timeout_seconds", 20.0)),
+        lease_seconds=float(bowxt_data.get("lease_seconds", 180.0)),
+        batch_size=int(bowxt_data.get("batch_size", 8)),
+        require_sender=bool(bowxt_data.get("require_sender", False)),
+        replay_existing=bool(bowxt_data.get("replay_existing", False)),
+        send_timeout_seconds=float(bowxt_data.get("send_timeout_seconds", 45.0)),
+    )
+    if not bowxt.base_url or not bowxt.consumer:
+        raise ValueError("bowxt.base_url 和 bowxt.consumer 不能为空")
+    if min(
+        bowxt.claim_timeout_seconds,
+        bowxt.lease_seconds,
+        bowxt.batch_size,
+        bowxt.send_timeout_seconds,
+    ) <= 0:
+        raise ValueError("bowxt 的超时、租约和批量大小必须大于 0")
+
+    image_data = data.get("image_context", {})
+    image_context = ImageContextConfig(
+        enabled=bool(image_data.get("enabled", False)),
+        cache_path=_resolve_path(base_dir, image_data.get("cache_path", "data/images")),
+        max_images=int(image_data.get("max_images", 4)),
+        max_image_bytes=int(image_data.get("max_image_bytes", 10 * 1024 * 1024)),
+        detail=str(image_data.get("detail", "auto")).strip() or "auto",
+        trigger_images=bool(image_data.get("trigger_images", False)),
+        lookback_seconds=int(image_data.get("lookback_seconds", 180)),
+    )
+    if image_context.detail not in {"auto", "low", "high"}:
+        raise ValueError("image_context.detail 必须是 auto、low 或 high")
+    if min(
+        image_context.max_images,
+        image_context.max_image_bytes,
+        image_context.lookback_seconds,
+    ) <= 0:
+        raise ValueError("image_context 的图片数和字节限制必须大于 0")
+
+    reminder_data = data.get("message_reminder", {})
+    raw_reminder_sources = reminder_data.get("source_groups")
+    if raw_reminder_sources is None:
+        reminder_sources = ()
+    elif isinstance(raw_reminder_sources, str):
+        reminder_sources = (
+            (raw_reminder_sources.strip(),) if raw_reminder_sources.strip() else ()
+        )
+    else:
+        reminder_sources = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in raw_reminder_sources
+                if str(value).strip()
+            )
+        )
+    message_reminder = MessageReminderConfig(
+        enabled=bool(reminder_data.get("enabled", False)),
+        group=str(reminder_data.get("group", "")).strip(),
+        source_groups=reminder_sources,
+        delay_seconds=float(reminder_data.get("delay_seconds", 300.0)),
+    )
+    if message_reminder.enabled and not message_reminder.group:
+        raise ValueError("message_reminder 启用时 group 不能为空")
+    if message_reminder.delay_seconds <= 0:
+        raise ValueError("message_reminder.delay_seconds 必须大于 0")
+    unknown_reminder_sources = sorted(
+        set(message_reminder.source_groups) - {group.name for group in groups}
+    )
+    if unknown_reminder_sources:
+        raise ValueError(
+            "message_reminder.source_groups 包含未监听的群："
+            + ", ".join(unknown_reminder_sources)
+        )
+    if message_reminder.enabled and not message_reminder.source_groups:
+        message_reminder = MessageReminderConfig(
+            enabled=True,
+            group=message_reminder.group,
+            source_groups=tuple(
+                group.name for group in groups if group.name != message_reminder.group
+            ),
+            delay_seconds=message_reminder.delay_seconds,
+        )
+
+    return BotConfig(
+        groups=groups,
+        llm=LLMConfig(
+            base_url=base_url,
+            model=model,
+            api_key=api_key,
+            temperature=float(llm_data.get("temperature", 0.3)),
+            max_tokens=int(llm_data.get("max_tokens", 700)),
+            timeout_seconds=float(llm_data.get("timeout_seconds", 60)),
+            retries=int(llm_data.get("retries", 2)),
+            thinking_enabled=thinking_enabled,
+        ),
+        search=search,
+        history=history,
+        conversation_pool=conversation_pool,
+        debug=debug,
+        reply_debounce=reply_debounce,
+        message_reminder=message_reminder,
+        bowxt=bowxt,
+        image_context=image_context,
+        system_prompt_path=_resolve_path(base_dir, data.get("system_prompt_path", "prompts/system.md")),
+        skills_path=_resolve_path(base_dir, data.get("skills_path", "skills")),
+        queue_size_per_group=int(data.get("queue_size_per_group", 5)),
+    )
+
+
+def _resolve_path(base_dir: Path, value: object) -> Path:
+    path = Path(str(value))
+    return path if path.is_absolute() else (base_dir / path).resolve()
+
+
+def _parse_group_config(item: object) -> GroupConfig:
+    if not isinstance(item, dict):
+        raise ValueError("groups 中的每一项必须是对象")
+    name = str(item.get("name", "")).strip()
+    bot_nickname = str(item.get("bot_nickname", "")).strip()
+    listen_mode = str(item.get("listen_mode", "mention_only")).strip() or "mention_only"
+    raw_reply_groups = item.get("reply_groups")
+    if raw_reply_groups is None:
+        reply_groups = (name,) if name else ()
+    elif isinstance(raw_reply_groups, str):
+        reply_groups = (raw_reply_groups.strip(),) if raw_reply_groups.strip() else ()
+    else:
+        reply_groups = tuple(str(value).strip() for value in raw_reply_groups if str(value).strip())
+    if not reply_groups and name:
+        reply_groups = (name,)
+    return GroupConfig(
+        name=name,
+        bot_nickname=bot_nickname,
+        listen_mode=listen_mode,
+        reply_groups=reply_groups,
+    )
