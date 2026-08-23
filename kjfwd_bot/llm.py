@@ -83,7 +83,10 @@ class OpenAIChatClient:
                     raise RuntimeError("LLM 返回了空回复")
                 return dict(message)
             except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")[:1000]
+                try:
+                    body = exc.read().decode("utf-8", errors="replace")[:1000]
+                finally:
+                    exc.close()
                 retryable = exc.code == 429 or 500 <= exc.code < 600
                 if not retryable or attempt + 1 >= attempts:
                     raise RuntimeError(f"LLM HTTP {exc.code}: {body}") from exc

@@ -38,6 +38,7 @@ class HistoryStore:
                 conversation_id TEXT,
                 source_key TEXT,
                 sender TEXT,
+                sender_organization TEXT,
                 message_type TEXT NOT NULL DEFAULT 'text',
                 image_path TEXT,
                 image_mime_type TEXT,
@@ -80,6 +81,7 @@ class HistoryStore:
         )
         self._ensure_column("messages", "conversation_id", "TEXT")
         self._ensure_column("messages", "sender", "TEXT")
+        self._ensure_column("messages", "sender_organization", "TEXT")
         self._ensure_column("messages", "message_type", "TEXT NOT NULL DEFAULT 'text'")
         self._ensure_column("messages", "image_path", "TEXT")
         self._ensure_column("messages", "image_mime_type", "TEXT")
@@ -102,6 +104,7 @@ class HistoryStore:
         source_key: Optional[str] = None,
         *,
         sender: Optional[str] = None,
+        sender_organization: Optional[str] = None,
         message_type: str = "text",
         image_path: Optional[str] = None,
         image_mime_type: Optional[str] = None,
@@ -128,8 +131,9 @@ class HistoryStore:
             try:
                 cursor = self._conn.execute(
                     "INSERT INTO messages(group_name, role, content, observed_at, session_id, source_key, "
-                    "sender, message_type, image_path, image_mime_type, image_sha256) "
-                    "VALUES (?, 'group', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "sender, sender_organization, message_type, image_path, "
+                    "image_mime_type, image_sha256) "
+                    "VALUES (?, 'group', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         group_name,
                         content,
@@ -137,6 +141,7 @@ class HistoryStore:
                         session_id,
                         source_key,
                         sender,
+                        sender_organization,
                         message_type or "text",
                         image_path,
                         image_mime_type,
@@ -276,6 +281,50 @@ class HistoryStore:
                 (conversation_id,),
             ).fetchone()
         return None if row is None else str(row["sender"])
+
+    def bind_recent_images_to_conversation(
+        self,
+        trigger_message: StoredMessage,
+        conversation_id: str,
+        *,
+        lookback_seconds: int,
+    ) -> Tuple[StoredMessage, ...]:
+        """Attach preceding unbound images from the same sender to a routed turn."""
+
+        if not trigger_message.sender:
+            return ()
+        cutoff = trigger_message.observed_at - lookback_seconds
+        with self._lock:
+            self._ensure_conversation_group(conversation_id, trigger_message.group_name)
+            rows = self._conn.execute(
+                "SELECT * FROM messages WHERE group_name=? AND role='group' "
+                "AND message_type='image' AND conversation_id IS NULL "
+                "AND sender=? AND observed_at>=? AND id<? ORDER BY id",
+                (
+                    trigger_message.group_name,
+                    trigger_message.sender,
+                    cutoff,
+                    trigger_message.id,
+                ),
+            ).fetchall()
+            if not rows:
+                return ()
+            ids = [int(row["id"]) for row in rows]
+            placeholders = ",".join("?" for _ in ids)
+            self._conn.execute(
+                f"UPDATE messages SET conversation_id=? WHERE id IN ({placeholders})",
+                (conversation_id, *ids),
+            )
+            self._conn.execute(
+                "UPDATE conversations SET message_count=message_count+? WHERE id=?",
+                (len(ids), conversation_id),
+            )
+            self._conn.commit()
+            attached = self._conn.execute(
+                f"SELECT * FROM messages WHERE id IN ({placeholders}) ORDER BY id",
+                tuple(ids),
+            ).fetchall()
+        return tuple(self._row_to_message(row) for row in attached)
 
     def bind_message_to_conversation(
         self,
@@ -530,6 +579,7 @@ class HistoryStore:
             source_key=row["source_key"],
             conversation_id=row["conversation_id"],
             sender=row["sender"],
+            sender_organization=row["sender_organization"],
             message_type=str(row["message_type"] or "text"),
             image_path=row["image_path"],
             image_mime_type=row["image_mime_type"],

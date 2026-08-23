@@ -36,6 +36,7 @@ class GroupConfig:
     name: str
     bot_nickname: str
     listen_mode: str = "mention_only"
+    always_reply_to_mentions: bool = False
     reply_groups: Tuple[str, ...] = ()
 
 
@@ -77,6 +78,12 @@ class SearchConfig:
 
 
 @dataclass(frozen=True)
+class DocumentsConfig:
+    root_path: Path
+    max_document_bytes: int = 262_144
+
+
+@dataclass(frozen=True)
 class ConversationPoolConfig:
     active_ttl_seconds: int = 1800
     max_active: int = 5
@@ -103,7 +110,7 @@ class BowxtConfig:
     claim_timeout_seconds: float = 20.0
     lease_seconds: float = 180.0
     batch_size: int = 8
-    require_sender: bool = False
+    require_sender: bool = True
     replay_existing: bool = False
     send_timeout_seconds: float = 45.0
 
@@ -117,6 +124,7 @@ class ImageContextConfig:
     detail: str = "auto"
     trigger_images: bool = False
     lookback_seconds: int = 180
+    require_viewer_clipboard: bool = True
 
 
 @dataclass(frozen=True)
@@ -132,6 +140,7 @@ class BotConfig:
     groups: Tuple[GroupConfig, ...]
     llm: LLMConfig
     search: SearchConfig
+    documents: DocumentsConfig
     history: HistoryConfig
     conversation_pool: ConversationPoolConfig
     debug: DebugConfig
@@ -154,6 +163,10 @@ class BotConfig:
     @property
     def listen_modes(self) -> Dict[str, str]:
         return {group.name: group.listen_mode for group in self.groups}
+
+    @property
+    def always_reply_to_mentions(self) -> Dict[str, bool]:
+        return {group.name: group.always_reply_to_mentions for group in self.groups}
 
     @property
     def reply_groups(self) -> Dict[str, Tuple[str, ...]]:
@@ -245,6 +258,18 @@ def load_config(
     ) <= 0:
         raise ValueError("search 的超时、结果数、上下文和工具轮数必须大于 0")
 
+    documents_data = data.get("documents", {})
+    documents = DocumentsConfig(
+        root_path=_resolve_path(
+            base_dir, documents_data.get("root_path", "documents")
+        ),
+        max_document_bytes=int(
+            documents_data.get("max_document_bytes", 262_144)
+        ),
+    )
+    if documents.max_document_bytes <= 0:
+        raise ValueError("documents.max_document_bytes 必须大于 0")
+
     pool_data = data.get("conversation_pool", {})
     conversation_pool = ConversationPoolConfig(
         active_ttl_seconds=int(pool_data.get("active_ttl_seconds", 1800)),
@@ -279,12 +304,18 @@ def load_config(
 
     bowxt_data = data.get("bowxt", {})
     bowxt = BowxtConfig(
-        base_url=str(bowxt_data.get("base_url", "http://127.0.0.1:8787")).strip(),
-        consumer=str(bowxt_data.get("consumer", "kjfwd-bot")).strip(),
+        base_url=(
+            os.getenv("BOWXT_BASE_URL", "").strip()
+            or str(bowxt_data.get("base_url", "http://127.0.0.1:8787")).strip()
+        ),
+        consumer=(
+            os.getenv("BOWXT_CONSUMER", "").strip()
+            or str(bowxt_data.get("consumer", "kjfwd-bot")).strip()
+        ),
         claim_timeout_seconds=float(bowxt_data.get("claim_timeout_seconds", 20.0)),
         lease_seconds=float(bowxt_data.get("lease_seconds", 180.0)),
         batch_size=int(bowxt_data.get("batch_size", 8)),
-        require_sender=bool(bowxt_data.get("require_sender", False)),
+        require_sender=bool(bowxt_data.get("require_sender", True)),
         replay_existing=bool(bowxt_data.get("replay_existing", False)),
         send_timeout_seconds=float(bowxt_data.get("send_timeout_seconds", 45.0)),
     )
@@ -307,6 +338,9 @@ def load_config(
         detail=str(image_data.get("detail", "auto")).strip() or "auto",
         trigger_images=bool(image_data.get("trigger_images", False)),
         lookback_seconds=int(image_data.get("lookback_seconds", 180)),
+        require_viewer_clipboard=bool(
+            image_data.get("require_viewer_clipboard", True)
+        ),
     )
     if image_context.detail not in {"auto", "low", "high"}:
         raise ValueError("image_context.detail 必须是 auto、low 或 high")
@@ -374,6 +408,7 @@ def load_config(
             thinking_enabled=thinking_enabled,
         ),
         search=search,
+        documents=documents,
         history=history,
         conversation_pool=conversation_pool,
         debug=debug,
@@ -398,6 +433,7 @@ def _parse_group_config(item: object) -> GroupConfig:
     name = str(item.get("name", "")).strip()
     bot_nickname = str(item.get("bot_nickname", "")).strip()
     listen_mode = str(item.get("listen_mode", "mention_only")).strip() or "mention_only"
+    always_reply_to_mentions = bool(item.get("always_reply_to_mentions", False))
     raw_reply_groups = item.get("reply_groups")
     if raw_reply_groups is None:
         reply_groups = (name,) if name else ()
@@ -411,5 +447,6 @@ def _parse_group_config(item: object) -> GroupConfig:
         name=name,
         bot_nickname=bot_nickname,
         listen_mode=listen_mode,
+        always_reply_to_mentions=always_reply_to_mentions,
         reply_groups=reply_groups,
     )

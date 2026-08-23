@@ -18,6 +18,7 @@ class PromptAndSkillTests(unittest.TestCase):
         self.assertIn("线上微信群中可能同时有前来咨询的客户和正在协助的真人科服队员", prompt)
         self.assertIn("不要把队员的追问、指导、诊断建议或风险提醒当作客户提供的故障现象", prompt)
         self.assertIn("不要抢答或覆盖队员判断", prompt)
+        self.assertIn("组织名为“柯基服务队”的发送者是科服队员", prompt)
 
     def test_skill_directory_is_extensible_and_explicit_command_is_detected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -61,6 +62,26 @@ class PromptAndSkillTests(unittest.TestCase):
             self.assertIn("当前日期：2026-07-05", system_prompt)
             self.assertIn("<conversation_transcript>", user_prompt)
             self.assertIn("<current_request>\n怎么修？", user_prompt)
+
+    def test_prompt_injects_sender_name_and_organization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            system = root / "system.md"
+            system.write_text("SYSTEM RULE", encoding="utf-8")
+            builder = PromptBuilder(system, CapabilityRegistry([]))
+            message = StoredMessage(
+                1,
+                "群",
+                "group",
+                "建议先拍一下报错",
+                1000,
+                "session",
+                sender="黄泽文",
+                sender_organization="柯基服务队",
+            )
+            snapshot = ContextSnapshot("群", "session", 1, (message,))
+            _system_prompt, user_prompt = builder.build(snapshot, "建议先拍一下报错", ())
+            self.assertIn("群成员（黄泽文，组织：柯基服务队）", user_prompt)
 
     def test_ambiguous_prompt_warns_against_same_speaker_attribution(self):
         with tempfile.TemporaryDirectory() as directory:

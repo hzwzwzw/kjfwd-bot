@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "id": "kjfwd-bot",
+  "name": "柯基服务队答疑 Agent",
+  "version": "0.2.0",
+  "description": "按群配置监听策略、识别发送者，并调用大模型解答客户问题。",
+  "entrypoint": [
+    "{python}",
+    "{plugin_dir}/app.py",
+    "--config",
+    "{config_path}",
+    "--env",
+    "{env_path}"
+  ],
+  "default_config_file": "config.example.json",
+  "resources": ["prompts", "skills", "documents"],
+  "lifecycle": {
+    "owner": "bowxt",
+    "standalone_fallback": true,
+    "stop_timeout_seconds": 30
+  },
+  "config_schema": {
+    "format": "json",
+    "help": "groups 决定监听的客户群；每个受管实例会被 bowxt 强制分配独立 consumer。"
+  },
+  "secret_schema": [
+    {"name": "API_KEY", "label": "模型 API Key", "required": true},
+    {"name": "BASE_URL", "label": "模型 API Base URL", "required": true},
+    {"name": "MODEL", "label": "模型名称", "required": true},
+    {"name": "BRAVE_KEY", "label": "Brave Search Key（关闭 search 时可不填）", "required": false}
+  ]
+}

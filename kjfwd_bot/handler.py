@@ -23,6 +23,7 @@ from .config import (
 )
 from .classifier import KeywordQuestionClassifier, MessageClassifier
 from .router import AlwaysNewRouter, Router, is_low_information_followup, title_from_request
+from .tool_context import current_tool_group
 
 logger = logging.getLogger(__name__)
 REFERENCE_NOTICE = "（内容仅供参考）"
@@ -162,6 +163,7 @@ class KJFWDHandler(MessageHandler):
         model: ChatModel,
         prompt_builder: PromptBuilder,
         listen_modes: Optional[Dict[str, str]] = None,
+        always_reply_to_mentions: Optional[Dict[str, bool]] = None,
         reply_groups: Optional[Dict[str, Tuple[str, ...]]] = None,
         router: Optional[Router] = None,
         classifier: Optional[MessageClassifier] = None,
@@ -180,6 +182,9 @@ class KJFWDHandler(MessageHandler):
         self.listen_modes = {name: "mention_only" for name in groups}
         if listen_modes:
             self.listen_modes.update(listen_modes)
+        self.always_reply_to_mentions = {name: False for name in groups}
+        if always_reply_to_mentions:
+            self.always_reply_to_mentions.update(always_reply_to_mentions)
         self.reply_groups = {name: (name,) for name in groups}
         if reply_groups:
             self.reply_groups.update({name: tuple(targets) for name, targets in reply_groups.items()})
@@ -227,6 +232,7 @@ class KJFWDHandler(MessageHandler):
             float(event.timestamp),
             source_key,
             sender=event.sender,
+            sender_organization=event.sender_organization,
             message_type=event.message_type,
             image_path=event.image_path,
             image_mime_type=event.image_mime_type,
@@ -261,6 +267,7 @@ class KJFWDHandler(MessageHandler):
             inserted
             and self.message_reminder.enabled
             and reminder_managed
+            and not is_at_me
             and question_decision is None
             and not self._is_command_request(request)
         ):
@@ -268,6 +275,7 @@ class KJFWDHandler(MessageHandler):
                 group_name=event.group,
                 content=request,
                 sender=event.sender,
+                sender_organization=event.sender_organization,
                 recent_messages=recent_messages,
             )
             if question_decision:
@@ -279,6 +287,7 @@ class KJFWDHandler(MessageHandler):
             request,
             question_decision=question_decision,
             sender=event.sender,
+            sender_organization=event.sender_organization,
             recent_messages=recent_messages,
         ):
             return None
@@ -348,7 +357,12 @@ class KJFWDHandler(MessageHandler):
         with self._context_lock:
             generation = self._context_generations[event.group]
         message, route = self._route_message(
-            event.group, message, request, float(event.timestamp), sender=event.sender
+            event.group,
+            message,
+            request,
+            float(event.timestamp),
+            sender=event.sender,
+            sender_organization=event.sender_organization,
         )
         snapshot = self._snapshot_for_route(message, route)
         job = ReplyJob(
@@ -445,6 +459,7 @@ class KJFWDHandler(MessageHandler):
         timestamp: float,
         *,
         sender: Optional[str] = None,
+        sender_organization: Optional[str] = None,
     ):
         candidates = self.history.list_active_conversations(
             group_name,
@@ -525,6 +540,8 @@ class KJFWDHandler(MessageHandler):
             }
             if "sender" in inspect.signature(self.router.route).parameters:
                 route_kwargs["sender"] = sender
+            if "sender_organization" in inspect.signature(self.router.route).parameters:
+                route_kwargs["sender_organization"] = sender_organization
             route = self.router.route(**route_kwargs)
 
         if route.action == "use_existing" and route.conversation_id:
@@ -547,6 +564,20 @@ class KJFWDHandler(MessageHandler):
             message = self.history.bind_message_to_conversation(
                 message.id, ambiguous.id, trigger_at=timestamp
             )
+        if route.conversation_id:
+            attached_images = self.history.bind_recent_images_to_conversation(
+                message,
+                route.conversation_id,
+                lookback_seconds=self.image_context.lookback_seconds,
+            )
+            if attached_images:
+                logger.info(
+                    "已绑定前置图片：group=%s conversation=%s sender=%s image_ids=%s",
+                    group_name,
+                    route.conversation_id,
+                    sender,
+                    ",".join(str(item.id) for item in attached_images),
+                )
         logger.info("会话路由：group=%s action=%s conversation=%s reason=%s", group_name, route.action, route.conversation_id, route.reason)
         return message, route
 
@@ -695,9 +726,10 @@ class KJFWDHandler(MessageHandler):
                     ",".join(job.reply_groups or self._reply_groups_for(group_name)),
                     _log_excerpt(job.clean_request),
                 )
-                reply = self.model.complete(
-                    system_prompt, user_prompt, force_search=job.force_search
-                ).strip()
+                with current_tool_group(group_name):
+                    reply = self.model.complete(
+                        system_prompt, user_prompt, force_search=job.force_search
+                    ).strip()
                 if not reply:
                     raise RuntimeError("模型返回空回复")
                 reply = self._finalize_reply(reply, job.snapshot.conversation_id, job.snapshot.ambiguous)
@@ -763,6 +795,7 @@ class KJFWDHandler(MessageHandler):
         *,
         question_decision: Optional[bool] = None,
         sender: Optional[str] = None,
+        sender_organization: Optional[str] = None,
         recent_messages: Sequence = (),
     ) -> bool:
         logger.info(
@@ -773,7 +806,7 @@ class KJFWDHandler(MessageHandler):
             _log_excerpt(request),
         )
         if is_at_me:
-            if mode != "question_only":
+            if mode != "question_only" or self.always_reply_to_mentions.get(group_name, False):
                 logger.info("触发通过：group=%s reason=at_mention", group_name)
                 return True
             if self._is_command_request(request):
@@ -785,6 +818,7 @@ class KJFWDHandler(MessageHandler):
                     group_name=group_name,
                     content=request,
                     sender=sender,
+                    sender_organization=sender_organization,
                     recent_messages=recent_messages,
                 )
             logger.info("问题分类结果：group=%s should_reply=%s request=%s", group_name, decision, _log_excerpt(request))
@@ -806,6 +840,7 @@ class KJFWDHandler(MessageHandler):
                     group_name=group_name,
                     content=request,
                     sender=sender,
+                    sender_organization=sender_organization,
                     recent_messages=recent_messages,
                 )
             logger.info("问题分类结果：group=%s should_reply=%s request=%s", group_name, decision, _log_excerpt(request))
@@ -840,12 +875,15 @@ class KJFWDHandler(MessageHandler):
         group_name: str,
         content: str,
         sender: Optional[str],
+        sender_organization: Optional[str],
         recent_messages: Sequence,
     ) -> bool:
         parameters = inspect.signature(self.classifier.should_reply).parameters
         kwargs = {"group_name": group_name, "content": content}
         if "sender" in parameters:
             kwargs["sender"] = sender
+        if "sender_organization" in parameters:
+            kwargs["sender_organization"] = sender_organization
         if "recent_messages" in parameters:
             kwargs["recent_messages"] = recent_messages
         return bool(self.classifier.should_reply(**kwargs))

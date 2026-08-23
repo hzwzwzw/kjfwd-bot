@@ -26,6 +26,7 @@ class Router(Protocol):
         candidates: Sequence[Conversation],
         recent_messages: dict[str, Sequence[StoredMessage]],
         sender: str | None = None,
+        sender_organization: str | None = None,
     ) -> ConversationRoute:
         ...
 
@@ -51,6 +52,7 @@ class ConversationRouter:
         candidates: Sequence[Conversation],
         recent_messages: dict[str, Sequence[StoredMessage]],
         sender: str | None = None,
+        sender_organization: str | None = None,
     ) -> ConversationRoute:
         if not candidates:
             return ConversationRoute("create_new", title=title_from_request(request))
@@ -65,7 +67,14 @@ class ConversationRouter:
             "发送人不同时，除非消息明确引用或承接该话题，否则不要把它们合并。"
             "只输出 JSON，不要输出 Markdown。"
         )
-        user = self._build_user_prompt(group_name, request, sender, candidates, recent_messages)
+        user = self._build_user_prompt(
+            group_name,
+            request,
+            sender,
+            candidates,
+            recent_messages,
+            sender_organization=sender_organization,
+        )
         try:
             logger.info(
                 "开始 LLM 会话路由：group=%s candidates=%s request=%s",
@@ -132,10 +141,13 @@ class ConversationRouter:
         sender: str | None,
         candidates: Sequence[Conversation],
         recent_messages: dict[str, Sequence[StoredMessage]],
+        *,
+        sender_organization: str | None = None,
     ) -> str:
         blocks = [
             f"群名：{group_name}",
             f"当前发送人：{sender or '未知'}",
+            f"当前发送人组织：{sender_organization or '未知'}",
             f"当前消息：{request}",
             "",
             "候选会话：",
@@ -148,6 +160,8 @@ class ConversationRouter:
             )
             for message in recent_messages.get(conversation.id, ())[-6:]:
                 role = "bot" if message.role == "assistant" else (message.sender or "群成员（未知）")
+                if message.role != "assistant" and message.sender_organization:
+                    role += f"（组织：{message.sender_organization}）"
                 blocks.append(f"- {role}: {message.content}")
         blocks.append(
             "\n输出格式三选一：\n"
@@ -167,6 +181,7 @@ class AlwaysNewRouter:
         candidates: Sequence[Conversation],
         recent_messages: dict[str, Sequence[StoredMessage]],
         sender: str | None = None,
+        sender_organization: str | None = None,
     ) -> ConversationRoute:
         return ConversationRoute("create_new", title=title_from_request(request))
 

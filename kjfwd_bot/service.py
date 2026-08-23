@@ -14,9 +14,12 @@ from .config import BotConfig, load_config
 from .handler import KJFWDHandler
 from .history import HistoryStore
 from .llm import OpenAIChatClient
+from .documents import MarkdownDocumentLibrary
 from .prompt import PromptBuilder
+from .panels import ConversationPanelPublisher
 from .router import ConversationRouter
 from .search import BraveSearchClient, WebSearchTool
+from .tools import GetHistoryTool, ListDocumentsTool, ReadDocumentTool
 from .transport import ForwardAction, MessageEvent, ReplyAction
 
 logger = logging.getLogger(__name__)
@@ -33,11 +36,19 @@ def process_group_names(config: BotConfig) -> tuple[str, ...]:
     return tuple(names)
 
 
-def build_handler(config: BotConfig, history: HistoryStore) -> KJFWDHandler:
+def build_handler(config: BotConfig, history: HistoryStore, bowxt_client: Any) -> KJFWDHandler:
     capabilities = CapabilityRegistry.from_skill_directory(config.skills_path)
     logger.info("已加载 skills: %s", ", ".join(capabilities.names) or "无")
     llm_client = OpenAIChatClient(config.llm)
-    tools = []
+    document_library = MarkdownDocumentLibrary(
+        config.documents.root_path,
+        max_document_bytes=config.documents.max_document_bytes,
+    )
+    tools = [
+        GetHistoryTool(bowxt_client),
+        ListDocumentsTool(document_library),
+        ReadDocumentTool(document_library),
+    ]
     if config.search.enabled:
         tools.append(WebSearchTool(BraveSearchClient(config.search)))
     agent = ToolCallingAgent(
@@ -49,6 +60,7 @@ def build_handler(config: BotConfig, history: HistoryStore) -> KJFWDHandler:
         groups=config.group_names,
         bot_nicknames=config.group_nicknames,
         listen_modes=config.listen_modes,
+        always_reply_to_mentions=config.always_reply_to_mentions,
         reply_groups=config.reply_groups,
         history=history,
         model=agent,
@@ -131,6 +143,7 @@ class BowxtTransport:
             group_nickname=nickname,
             is_at_me=message.is_at_me,
             sender=message.sender,
+            sender_organization=getattr(message, "sender_organization", None),
             message_type=message.message_type,
             image_path=str(image_path) if image_path else None,
             image_mime_type=message.image_mime_type,
@@ -142,7 +155,13 @@ class BowxtTransport:
         message = delivery.message
         if message.message_type != "image" or not self.config.image_context.enabled:
             return None
-        if not message.image_url:
+        source_is_original = message.image_source == "viewer_clipboard"
+        if not message.image_url or (
+            self.config.image_context.require_viewer_clipboard
+            and not source_is_original
+        ):
+            if self.config.image_context.require_viewer_clipboard:
+                raise RuntimeError("等待 bowxt 通过可见查看器和 Ctrl+C 获取清晰图片")
             if delivery.attempt <= 6:
                 raise RuntimeError("图片仍在 bowxt 可见界面抓取队列中")
             self._log(
@@ -185,12 +204,14 @@ def run(config_path: Path, env_path: Path, *, stop_event: threading.Event | None
     config = load_config(config_path, env_path=env_path)
     history = HistoryStore(config.history.database_path, config.history.idle_timeout_seconds)
     history.prune(config.history.retention_days)
-    handler = build_handler(config, history)
     client = AgentClient(config.bowxt.consumer, base_url=config.bowxt.base_url)
+    handler = build_handler(config, history, client)
     transport = BowxtTransport(client, config)
     chat_ids = transport.prepare()
     handler.set_action_emitter(transport.emit)
     stopping = stop_event or threading.Event()
+    panel_publisher = ConversationPanelPublisher(client, history, config, stopping)
+    panel_publisher.start()
     logger.info(
         "kjfwd-bot 已连接 bowxt：consumer=%s groups=%s image_context=%s",
         config.bowxt.consumer,
@@ -204,6 +225,8 @@ def run(config_path: Path, env_path: Path, *, stop_event: threading.Event | None
         context={
             "groups": list(config.group_names),
             "image_context": config.image_context.enabled,
+            "require_sender": config.bowxt.require_sender,
+            "require_viewer_clipboard": config.image_context.require_viewer_clipboard,
         },
     )
     try:
@@ -254,6 +277,8 @@ def run(config_path: Path, env_path: Path, *, stop_event: threading.Event | None
                         },
                     )
     finally:
+        stopping.set()
+        panel_publisher.join(timeout=2.5)
         handler.stop()
         history.close()
 

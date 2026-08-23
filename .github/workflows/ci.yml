@@ -1,0 +1,99 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+concurrency:
+  group: kjfwd-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install package
+        run: python -m pip install -e .
+      - name: Unit tests
+        run: python -W error::ResourceWarning -m unittest discover -s tests -v
+      - name: Compile
+        run: python -m compileall -q app.py kjfwd_bot tests
+
+  package:
+    name: package artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install build
+      - run: python -m build
+      - name: Verify wheel installation
+        run: |
+          python -m venv /tmp/kjfwd-wheel
+          /tmp/kjfwd-wheel/bin/pip install dist/*.whl
+          /tmp/kjfwd-wheel/bin/python -c 'import app, kjfwd_bot, kjfwd_bot.service'
+
+  bowxt-simulation-e2e:
+    name: bowxt simulation to Agent reply
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: hzwzwzw/bowxt
+          path: bowxt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install both projects
+        run: python -m pip install -e './bowxt[vision]' -e .
+      - name: Run the real consumer and handler against deterministic services
+        run: python tests/ci_bowxt_simulation_e2e.py
+
+  real-llm:
+    name: real LLM provider smoke
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      API_KEY: ${{ secrets.KJFWD_API_KEY }}
+      BASE_URL: ${{ secrets.KJFWD_BASE_URL }}
+      MODEL: ${{ secrets.KJFWD_MODEL }}
+      KJFWD_RUN_LLM_TEST: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e .
+      - name: Verify provider secrets are configured
+        run: test -n "$API_KEY" && test -n "$BASE_URL" && test -n "$MODEL"
+      - name: Exercise the configured OpenAI-compatible endpoint
+        run: python -W error::ResourceWarning -m unittest tests.test_llm_integration -v

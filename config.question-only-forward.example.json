@@ -47,6 +47,10 @@
     "minimum_request_interval_seconds": 1.1,
     "max_tool_rounds": 2
   },
+  "documents": {
+    "root_path": "documents",
+    "max_document_bytes": 262144
+  },
   "history": {
     "database_path": "data/kjfwd.db",
     "idle_timeout_seconds": 1800,

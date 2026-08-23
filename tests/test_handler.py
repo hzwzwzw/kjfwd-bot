@@ -18,6 +18,7 @@ from kjfwd_bot.handler import (
 from kjfwd_bot.history import HistoryStore
 from kjfwd_bot.models import ConversationRoute
 from kjfwd_bot.prompt import PromptBuilder
+from kjfwd_bot.tool_context import require_current_group
 
 
 class FakeRaw:
@@ -81,6 +82,15 @@ class BlockingModel:
         return "这是一条已经过期的回复。"
 
 
+class GroupAwareModel:
+    def __init__(self):
+        self.group = None
+
+    def complete(self, system_prompt, user_prompt, *, force_search=False):
+        self.group = require_current_group()
+        return "已识别当前群。"
+
+
 class HandlerTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -110,6 +120,22 @@ class HandlerTests(unittest.TestCase):
         self.handler.stop()
         self.store.close()
         self.tempdir.cleanup()
+
+    def test_model_tool_context_is_scoped_to_worker_group(self):
+        model = GroupAwareModel()
+        self.handler.model = model
+        self.handler.handle(
+            MessageEvent(
+                group="二群",
+                content="@柯基服务队  请查看之前的消息",
+                timestamp=time.time(),
+                group_nickname="柯基服务队",
+                is_at_me=True,
+                raw=FakeRaw((99, 1)),
+            )
+        )
+        self.assertTrue(self.action_ready.wait(2))
+        self.assertEqual(model.group, "二群")
 
     def test_duplicate_at_with_changed_runtime_id_only_generates_one_reply_and_sets_sent(self):
         event = MessageEvent(
@@ -231,6 +257,28 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(2, len(classifier.calls))
         self.assertEqual(1, len(self.model.calls))
         self.assertIn("电脑蓝屏怎么办", self.model.calls[0][1])
+
+    def test_question_only_mode_always_replies_to_at_without_classifier(self):
+        classifier = FakeClassifier([False])
+        self.handler.classifier = classifier
+        self.handler.listen_modes["客户群"] = "question_only"
+        self.handler.always_reply_to_mentions["客户群"] = True
+
+        self.handler.handle(
+            MessageEvent(
+                "客户群",
+                "@柯基服务队\u2005 测试：我是谁",
+                time.time(),
+                "柯基服务队",
+                True,
+                FakeRaw((32, 3)),
+            )
+        )
+
+        self.assertTrue(self.action_ready.wait(2))
+        self.assertEqual([], classifier.calls)
+        self.assertEqual(1, len(self.model.calls))
+        self.assertIn("<current_request>\n测试：我是谁", self.model.calls[0][1])
 
     def test_unanswered_latest_question_emits_message_reminder(self):
         self.handler.message_reminder = MessageReminderConfig(

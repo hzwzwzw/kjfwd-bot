@@ -1,6 +1,7 @@
 import unittest
 
 from kjfwd_bot.classifier import KeywordQuestionClassifier, LLMQuestionClassifier
+from kjfwd_bot.models import StoredMessage
 
 
 class FakeClassifierClient:
@@ -31,13 +32,36 @@ class ClassifierTests(unittest.TestCase):
     def test_llm_classifier_prompt_prioritizes_customer_questions(self):
         client = FakeClassifierClient()
         classifier = LLMQuestionClassifier(client)
-        self.assertFalse(classifier.should_reply(group_name="群", content="把报错截图发一下"))
+        recent = (
+            StoredMessage(
+                1,
+                "群",
+                "group",
+                "先重启看看",
+                1000,
+                "s",
+                sender="李四",
+                sender_organization="柯基服务队",
+            ),
+        )
+        self.assertFalse(classifier.should_reply(
+            group_name="群",
+            content="把报错截图发一下",
+            sender="黄泽文",
+            sender_organization="柯基服务队",
+            recent_messages=recent,
+        ))
         messages, thinking = client.calls[0]
         system_prompt = messages[0]["content"]
+        user_prompt = messages[1]["content"]
         self.assertFalse(thinking)
         self.assertIn("只应该回答像客户发出的求助消息", system_prompt)
         self.assertIn("科服队员", system_prompt)
         self.assertIn("宁可输出 false", system_prompt)
+        self.assertIn("组织名为“柯基服务队”的发送者是科服队员", system_prompt)
+        self.assertIn("当前发送人：黄泽文", user_prompt)
+        self.assertIn("当前发送人组织：柯基服务队", user_prompt)
+        self.assertIn("李四（组织：柯基服务队）", user_prompt)
 
 
 if __name__ == "__main__":

@@ -53,6 +53,12 @@ class FakeTool(ToolCapability):
         return json.dumps({"results": [{"url": "https://example.test"}]})
 
 
+class FakeDocumentTool(FakeTool):
+    @property
+    def name(self):
+        return "list_doc"
+
+
 class AgentTests(unittest.TestCase):
     def test_forced_search_uses_named_tool_then_returns_answer(self):
         client = FakeClient(
@@ -96,6 +102,15 @@ class AgentTests(unittest.TestCase):
         agent = ToolCallingAgent(client, [FakeTool()])
         self.assertEqual("direct answer", agent.complete("system", "question"))
         self.assertEqual("auto", client.calls[0]["tool_choice"])
+
+    def test_document_tools_do_not_force_missing_web_search(self):
+        client = FakeClient([{"role": "assistant", "content": "direct answer"}])
+        agent = ToolCallingAgent(client, [FakeDocumentTool()])
+        result = agent.complete("system", "Intel i5-12400 的参数")
+        self.assertEqual(result, "direct answer")
+        self.assertEqual(client.calls[0]["tool_choice"], "auto")
+        with self.assertRaisesRegex(RuntimeError, "联网搜索未启用"):
+            agent.complete("system", "/search Intel i5-12400", force_search=True)
 
     def test_specific_hardware_parameters_require_search(self):
         self.assertTrue(

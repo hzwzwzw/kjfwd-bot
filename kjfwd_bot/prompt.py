@@ -68,7 +68,10 @@ class PromptBuilder:
             if message.role == "assistant":
                 speaker = "机器人"
             else:
-                speaker = f"群成员（{message.sender}）" if message.sender else "群成员（身份未知）"
+                identity = message.sender or "身份未知"
+                if message.sender_organization:
+                    identity += f"，组织：{message.sender_organization}"
+                speaker = f"群成员（{identity}）"
             attachment = ""
             if message.message_type == "image":
                 attachment = f" [图片附件 message_id={message.id}]"
@@ -130,6 +133,8 @@ class PromptBuilder:
             if self.image_context.detail != "auto":
                 image_url["detail"] = self.image_context.detail
             label = message.sender or "发送人未知"
+            if message.sender_organization:
+                label += f"，组织={message.sender_organization}"
             parts.append(
                 {
                     "type": "text",

@@ -83,9 +83,10 @@ class ToolCallingAgent:
         definitions = [tool.definition() for tool in self.tools.values()]
         sources: List[Dict[str, str]] = []
         grounding_contents: List[str] = []
+        has_web_search = "web_search" in self.tools
+        if force_search and not has_web_search:
+            raise RuntimeError("联网搜索未启用")
         if not definitions:
-            if force_search:
-                raise RuntimeError("联网搜索未启用")
             text = self.client.complete(system_prompt, user_prompt)
             logger.info("LLM 回答完成：tools=none chars=%s", len(text))
             return self._finalize(
@@ -93,7 +94,9 @@ class ToolCallingAgent:
             )
 
         for round_index in range(self.max_tool_rounds):
-            require_search = force_search or should_require_search(user_prompt)
+            require_search = has_web_search and (
+                force_search or should_require_search(user_prompt)
+            )
             logger.info(
                 "LLM 工具轮：round=%s require_search=%s force_search=%s",
                 round_index + 1,

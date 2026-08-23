@@ -31,6 +31,7 @@ class BowxtMigrationTests(unittest.TestCase):
                     1000,
                     "bowxt:42",
                     sender="张三",
+                    sender_organization="柯基服务队",
                     message_type="image",
                     image_path="/tmp/example.png",
                     image_mime_type="image/png",
@@ -38,6 +39,7 @@ class BowxtMigrationTests(unittest.TestCase):
                 )
                 self.assertTrue(inserted)
                 self.assertEqual("张三", message.sender)
+                self.assertEqual("柯基服务队", message.sender_organization)
                 self.assertEqual("image", message.message_type)
                 self.assertEqual("/tmp/example.png", message.image_path)
                 duplicate, inserted = store.record_group_message(
@@ -74,6 +76,7 @@ class BowxtMigrationTests(unittest.TestCase):
                 1000,
                 "session",
                 sender="张三",
+                sender_organization="柯基服务队",
                 message_type="image",
                 image_path=str(image),
                 image_mime_type="image/png",
@@ -82,7 +85,7 @@ class BowxtMigrationTests(unittest.TestCase):
             _system, content = builder.build(snapshot, "这张图怎么处理？", ())
             self.assertIsInstance(content, list)
             text = "\n".join(part.get("text", "") for part in content if part["type"] == "text")
-            self.assertIn("群成员（张三）", text)
+            self.assertIn("群成员（张三，组织：柯基服务队）", text)
             image_parts = [part for part in content if part["type"] == "image_url"]
             self.assertEqual(1, len(image_parts))
             self.assertTrue(image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,"))
@@ -95,9 +98,15 @@ class BowxtMigrationTests(unittest.TestCase):
             )
         }
         prompt = ConversationRouter._build_user_prompt(
-            "群", "还是不行", "张三", (conversation,), messages
+            "群",
+            "还是不行",
+            "张三",
+            (conversation,),
+            messages,
+            sender_organization="柯基服务队",
         )
         self.assertIn("当前发送人：张三", prompt)
+        self.assertIn("当前发送人组织：柯基服务队", prompt)
         self.assertIn("- 张三: 打印机脱机", prompt)
 
     def test_low_information_followup_prefers_same_sender_conversation(self):
@@ -177,13 +186,84 @@ class BowxtMigrationTests(unittest.TestCase):
                     "群", "[图片]", 1002, "bot", False, sender="张三", message_type="image"
                 )
                 self.assertTrue(handler._image_should_trigger(event, image))
-                _message, route = handler._route_message(
+                routed_image, route = handler._route_message(
                     "群", image, "请结合图片继续分析。", 1002, sender="张三"
                 )
                 self.assertEqual(conversation.id, route.conversation_id)
                 self.assertEqual("image_followup_same_sender", route.reason)
+                snapshot = store.conversation_snapshot(
+                    routed_image,
+                    conversation.id,
+                    max_messages=10,
+                    max_characters=1000,
+                )
+                self.assertEqual(
+                    ["电脑蓝屏怎么办", "[图片]"],
+                    [item.content for item in snapshot.messages],
+                )
             finally:
                 store.close()
+
+    def test_image_sent_before_text_is_attached_to_new_conversation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            system = root / "system.md"
+            system.write_text("SYSTEM", encoding="utf-8")
+            store = HistoryStore(root / "history.db")
+            try:
+                image, _ = store.record_group_message(
+                    "群",
+                    "[图片]",
+                    1000,
+                    "bowxt:1",
+                    sender="张三",
+                    message_type="image",
+                    image_path=str(root / "clear.png"),
+                )
+                question, _ = store.record_group_message(
+                    "群", "这个界面怎么办", 1001, "bowxt:2", sender="张三"
+                )
+                handler = KJFWDHandler(
+                    groups=("群",),
+                    bot_nicknames={"群": "bot"},
+                    history=store,
+                    model=SimpleNamespace(),
+                    prompt_builder=PromptBuilder(system, CapabilityRegistry([])),
+                    image_context=ImageContextConfig(enabled=True, lookback_seconds=180),
+                )
+                routed, route = handler._route_message(
+                    "群", question, "这个界面怎么办", 1001, sender="张三"
+                )
+                snapshot = store.conversation_snapshot(
+                    routed,
+                    route.conversation_id,
+                    max_messages=10,
+                    max_characters=1000,
+                )
+                self.assertEqual(
+                    [image.id, question.id], [item.id for item in snapshot.messages]
+                )
+                self.assertEqual(
+                    ["image", "text"], [item.message_type for item in snapshot.messages]
+                )
+            finally:
+                store.close()
+
+    def test_low_resolution_preview_waits_for_viewer_clipboard_upgrade(self):
+        config = SimpleNamespace(
+            group_nicknames={"群": "bot"},
+            image_context=ImageContextConfig(
+                enabled=True, require_viewer_clipboard=True
+            ),
+        )
+        transport = BowxtTransport(SimpleNamespace(), config)
+        message = SimpleNamespace(
+            message_type="image",
+            image_url="/api/messages/1/image",
+            image_source="window_pixels",
+        )
+        with self.assertRaisesRegex(RuntimeError, "Ctrl\\+C"):
+            transport._cache_image(SimpleNamespace(message=message, attempt=20))
 
     def test_bowxt_delivery_maps_stable_seq_sender_and_at_state(self):
         config = SimpleNamespace(
@@ -199,6 +279,7 @@ class BowxtMigrationTests(unittest.TestCase):
             observed_at="2026-08-19T17:00:00+00:00",
             is_at_me=True,
             sender="张三",
+            sender_organization="柯基服务队",
             message_type="text",
             image_mime_type=None,
             image_sha256=None,
@@ -206,6 +287,7 @@ class BowxtMigrationTests(unittest.TestCase):
         event = transport.event_from_delivery(SimpleNamespace(message=message, attempt=1))
         self.assertEqual("bowxt:123", event.source_key)
         self.assertEqual("张三", event.sender)
+        self.assertEqual("柯基服务队", event.sender_organization)
         self.assertTrue(event.is_at_me)
         self.assertEqual("kirotta", event.group_nickname)
 

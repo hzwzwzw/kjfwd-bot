@@ -25,6 +25,7 @@ class MessageEvent:
     image_mime_type: Optional[str] = None
     image_sha256: Optional[str] = None
     source_key: Optional[str] = None
+    sender_organization: Optional[str] = None
 
 
 @dataclass(frozen=True)
